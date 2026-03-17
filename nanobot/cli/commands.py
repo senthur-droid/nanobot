@@ -562,8 +562,23 @@ def gateway(
         async def _silent(*_args, **_kwargs):
             pass
 
+        # Read the full HEARTBEAT.md so the agent has the complete context
+        hb_file = config.workspace_path / "HEARTBEAT.md"
+        hb_context = ""
+        if hb_file.exists():
+            try:
+                hb_context = f"\n\n---\nFull HEARTBEAT.md:\n{hb_file.read_text(encoding='utf-8')}"
+            except Exception:
+                pass
+
+        prompt = (
+            f"[HEARTBEAT] Execute the following active tasks NOW. "
+            f"Do not describe or summarize them — actually perform the work using your tools.\n\n"
+            f"Active tasks: {tasks}{hb_context}"
+        )
+
         return await agent.process_direct(
-            tasks,
+            prompt,
             session_key="heartbeat",
             channel=channel,
             chat_id=chat_id,

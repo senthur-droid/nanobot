@@ -246,12 +246,93 @@ class AgentLoop:
 
         if final_content is None and iteration >= self.max_iterations:
             logger.warning("Max iterations ({}) reached", self.max_iterations)
+            saved = await self._safety_commit()
+            suffix = ""
+            if saved:
+                suffix = "\n\nSafety commit: " + "; ".join(saved)
             final_content = (
                 f"I reached the maximum number of tool call iterations ({self.max_iterations}) "
                 "without completing the task. You can try breaking the task into smaller steps."
+                f"{suffix}"
             )
 
         return final_content, tools_used, messages
+
+    async def _safety_commit(self) -> list[str]:
+        """Commit and push uncommitted work in monitored repos when max iterations is hit."""
+        repos_dir = Path.home() / "repos"
+        if not repos_dir.is_dir():
+            return []
+
+        saved: list[str] = []
+        for repo_path in sorted(repos_dir.iterdir()):
+            if not (repo_path / ".git").exists():
+                continue
+            try:
+                # Check for uncommitted changes
+                proc = await asyncio.create_subprocess_exec(
+                    "git", "status", "--porcelain",
+                    cwd=str(repo_path),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await proc.communicate()
+                if not stdout or not stdout.strip():
+                    continue
+
+                # Get current branch
+                proc = await asyncio.create_subprocess_exec(
+                    "git", "rev-parse", "--abbrev-ref", "HEAD",
+                    cwd=str(repo_path),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                branch_out, _ = await proc.communicate()
+                branch = branch_out.decode().strip()
+
+                # Don't commit on main/master
+                if branch in ("main", "master"):
+                    logger.info("Safety commit: skipping {} (on {})", repo_path.name, branch)
+                    continue
+
+                # Stage and commit
+                await asyncio.create_subprocess_exec(
+                    "git", "add", "-A", cwd=str(repo_path),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                proc = await asyncio.create_subprocess_exec(
+                    "git", "commit", "-m",
+                    f"wip: save progress (max iterations reached on {branch})",
+                    cwd=str(repo_path),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await proc.communicate()
+                if proc.returncode != 0:
+                    continue
+
+                # Push
+                proc = await asyncio.create_subprocess_exec(
+                    "git", "push", "origin", branch,
+                    cwd=str(repo_path),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                push_out, push_err = await proc.communicate()
+                if proc.returncode == 0:
+                    saved.append(f"{repo_path.name}@{branch} committed and pushed")
+                    logger.info("Safety commit: saved {} on {}", repo_path.name, branch)
+                else:
+                    saved.append(f"{repo_path.name}@{branch} committed (push failed)")
+                    logger.warning(
+                        "Safety commit: push failed for {}: {}",
+                        repo_path.name, push_err.decode()[:200],
+                    )
+            except Exception as e:
+                logger.warning("Safety commit error for {}: {}", repo_path.name, e)
+
+        return saved
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""

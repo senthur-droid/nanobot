@@ -130,9 +130,14 @@ class HeartbeatService:
 
     async def _run_loop(self) -> None:
         """Main heartbeat loop."""
+        first = True
         while self._running:
             try:
-                await asyncio.sleep(self.interval_s)
+                if first:
+                    first = False
+                    await asyncio.sleep(10)  # brief startup delay
+                else:
+                    await asyncio.sleep(self.interval_s)
                 if self._running:
                     await self._tick()
             except asyncio.CancelledError:
