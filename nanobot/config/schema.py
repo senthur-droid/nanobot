@@ -95,6 +95,7 @@ class HeartbeatConfig(Base):
 
     enabled: bool = True
     interval_s: int = 30 * 60  # 30 minutes
+    notify_mode: Literal["evaluate", "always", "never"] = "evaluate"
 
 
 class GatewayConfig(Base):
@@ -103,6 +104,7 @@ class GatewayConfig(Base):
     host: str = "0.0.0.0"
     port: int = 18790
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
+    cron_notify_mode: Literal["evaluate", "always", "never"] = "evaluate"
 
 
 class WebSearchConfig(Base):

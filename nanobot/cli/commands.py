@@ -2,6 +2,7 @@
 
 import asyncio
 from contextlib import contextmanager, nullcontext
+import json
 import os
 import select
 import signal
@@ -522,9 +523,14 @@ def gateway(
             return response
 
         if job.payload.deliver and job.payload.to and response:
-            should_notify = await evaluate_response(
-                response, job.payload.message, provider, agent.model,
-            )
+            if config.gateway.cron_notify_mode == "always":
+                should_notify = True
+            elif config.gateway.cron_notify_mode == "never":
+                should_notify = False
+            else:
+                should_notify = await evaluate_response(
+                    response, job.payload.message, provider, agent.model,
+                )
             if should_notify:
                 from nanobot.bus.events import OutboundMessage
                 await bus.publish_outbound(OutboundMessage(
@@ -561,6 +567,120 @@ def gateway(
 
         async def _silent(*_args, **_kwargs):
             pass
+
+        async def _run_cmd(*cmd: str) -> tuple[int, str, str]:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            out_b, err_b = await proc.communicate()
+            out = out_b.decode("utf-8", errors="replace")
+            err = err_b.decode("utf-8", errors="replace")
+            return proc.returncode or 0, out, err
+
+        bot_login = os.getenv("NANOBOT_BOT_LOGIN", "senthur-droid")
+        deterministic_summaries: list[str] = []
+
+        # Deterministic backlog picker: always process oldest assigned open issue.
+        rc, out, _err = await _run_cmd(
+            "gh", "search", "issues",
+            "--assignee", bot_login,
+            "--state", "open",
+            "--json", "number,title,repository,createdAt,url",
+            "--limit", "100",
+        )
+        if rc == 0 and out.strip():
+            try:
+                issues = json.loads(out)
+            except json.JSONDecodeError:
+                issues = []
+            if issues:
+                issues_sorted = sorted(issues, key=lambda i: i.get("createdAt", ""))
+                issue = issues_sorted[0]
+                repo = (issue.get("repository") or {}).get("nameWithOwner", "")
+                number = issue.get("number")
+                title = issue.get("title", "")
+                url = issue.get("url", "")
+                if repo and number:
+                    issue_prompt = (
+                        f"[HEARTBEAT-BACKLOG] Process assigned issue now: {repo}#{number}\n"
+                        f"Title: {title}\nURL: {url}\n\n"
+                        "Follow the swe-workflow skill end-to-end.\n"
+                        "Use deterministic wrappers at /home/nimbus/vps-setup/scripts/run-task.sh github.* "
+                        "for issue comments, branch setup, and PR actions.\n"
+                        "Do actual implementation work now; if blocked, report a concrete blocker."
+                    )
+                    issue_response = await agent.process_direct(
+                        issue_prompt,
+                        session_key="heartbeat",
+                        channel=channel,
+                        chat_id=chat_id,
+                        on_progress=_silent,
+                    )
+                    if issue_response:
+                        deterministic_summaries.append(
+                            f"Issue backlog action ({repo}#{number}): {issue_response}"
+                        )
+
+        # Deterministic PR-review trigger: pick first open PR with actionable comments.
+        rc, out, _err = await _run_cmd(
+            "gh", "search", "prs",
+            "--author", bot_login,
+            "--state", "open",
+            "--json", "number,title,repository,url",
+            "--limit", "50",
+        )
+        if rc == 0 and out.strip():
+            try:
+                prs = json.loads(out)
+            except json.JSONDecodeError:
+                prs = []
+            actionable_pr: tuple[str, int, int, str] | None = None
+            for pr in prs:
+                repo = (pr.get("repository") or {}).get("nameWithOwner", "")
+                number = pr.get("number")
+                pr_url = pr.get("url", "")
+                if not repo or not number:
+                    continue
+                rc2, out2, _err2 = await _run_cmd(
+                    "python3",
+                    "/home/nimbus/vps-setup/scripts/parse-pr-comments.py",
+                    repo,
+                    str(number),
+                    "--json",
+                )
+                if rc2 != 0:
+                    continue
+                try:
+                    parsed = json.loads(out2)
+                except json.JSONDecodeError:
+                    continue
+                total = int(parsed.get("total_comments", 0) or 0)
+                if total > 0:
+                    actionable_pr = (repo, int(number), total, pr_url)
+                    break
+            if actionable_pr:
+                repo, number, total, pr_url = actionable_pr
+                pr_prompt = (
+                    f"[HEARTBEAT-BACKLOG] Address PR review backlog now: {repo}#{number}\n"
+                    f"URL: {pr_url}\nActionable comments: {total}\n\n"
+                    "Follow the pr-review-handler skill and push fixes/replies now."
+                )
+                pr_response = await agent.process_direct(
+                    pr_prompt,
+                    session_key="heartbeat",
+                    channel=channel,
+                    chat_id=chat_id,
+                    on_progress=_silent,
+                )
+                if pr_response:
+                    deterministic_summaries.append(
+                        f"PR review action ({repo}#{number}): {pr_response}"
+                    )
+
+        if deterministic_summaries:
+            return "\n\n".join(deterministic_summaries)
 
         # Read the full HEARTBEAT.md so the agent has the complete context
         hb_file = config.workspace_path / "HEARTBEAT.md"
@@ -602,6 +722,7 @@ def gateway(
         on_notify=on_heartbeat_notify,
         interval_s=hb_cfg.interval_s,
         enabled=hb_cfg.enabled,
+        notify_mode=hb_cfg.notify_mode,
     )
 
     if channels.enabled_channels:

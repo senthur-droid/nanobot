@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Coroutine
+from typing import TYPE_CHECKING, Any, Callable, Coroutine, Literal
 
 from loguru import logger
 
@@ -59,6 +59,7 @@ class HeartbeatService:
         on_notify: Callable[[str], Coroutine[Any, Any, None]] | None = None,
         interval_s: int = 30 * 60,
         enabled: bool = True,
+        notify_mode: Literal["evaluate", "always", "never"] = "evaluate",
     ):
         self.workspace = workspace
         self.provider = provider
@@ -67,6 +68,7 @@ class HeartbeatService:
         self.on_notify = on_notify
         self.interval_s = interval_s
         self.enabled = enabled
+        self.notify_mode = notify_mode
         self._running = False
         self._task: asyncio.Task | None = None
 
@@ -147,8 +149,6 @@ class HeartbeatService:
 
     async def _tick(self) -> None:
         """Execute a single heartbeat tick."""
-        from nanobot.utils.evaluator import evaluate_response
-
         content = self._read_heartbeat_file()
         if not content:
             logger.debug("Heartbeat: HEARTBEAT.md missing or empty")
@@ -168,14 +168,23 @@ class HeartbeatService:
                 response = await self.on_execute(tasks)
 
                 if response:
-                    should_notify = await evaluate_response(
-                        response, tasks, self.provider, self.model,
-                    )
+                    if self.notify_mode == "always":
+                        should_notify = True
+                        reason = "notify_mode=always"
+                    elif self.notify_mode == "never":
+                        should_notify = False
+                        reason = "notify_mode=never"
+                    else:
+                        from nanobot.utils.evaluator import evaluate_response
+                        should_notify = await evaluate_response(
+                            response, tasks, self.provider, self.model,
+                        )
+                        reason = "post-run evaluation"
                     if should_notify and self.on_notify:
-                        logger.info("Heartbeat: completed, delivering response")
+                        logger.info("Heartbeat: completed, delivering response ({})", reason)
                         await self.on_notify(response)
                     else:
-                        logger.info("Heartbeat: silenced by post-run evaluation")
+                        logger.info("Heartbeat: response suppressed ({})", reason)
         except Exception:
             logger.exception("Heartbeat execution failed")
 
